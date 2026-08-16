@@ -62,6 +62,14 @@ def main():
         ),
     )
     parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help=(
+            "Prepare/reuse the selected streamed-weight format and exit before inference. Useful "
+            "for doing the one-time MLX 4-bit conversion in a separate Python process."
+        ),
+    )
+    parser.add_argument(
         "--thinking",
         action="store_true",
         help="Enable Qwen3.8 thinking mode. The smoke test defaults to direct/non-thinking mode.",
@@ -85,6 +93,15 @@ def main():
         show_memory_util=args.show_memory,
         compression=args.compression,
     )
+
+    if args.prepare_only:
+        logical_bytes, shard_files = _logical_stream_bytes(model)
+        print("preparation complete")
+        print(f"weights: {'MLX affine 4-bit' if getattr(model, 'mlx_quantized', False) else 'FP16'}")
+        print(f"checkpoint path: {model.checkpoint_path}")
+        print(f"streamed shard files/pass: {len(shard_files)}")
+        print(f"logical weight bytes/pass: {_format_bytes(logical_bytes)}")
+        return
 
     messages = [
         {"role": "user", "content": "Reply with exactly: Qwen3.8 AirLLM MLX is running."},
