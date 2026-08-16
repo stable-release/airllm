@@ -5,6 +5,7 @@ is_on_mac_os = platform == "darwin"
 if is_on_mac_os:
     from .airllm_llama_mlx import AirLLMLlamaMlx
     from .airllm_qwen35_mlx_fast import AirLLMQwen35Mlx
+    from .airllm_qwen35_mlx_fp8 import AirLLMQwen35MlxFp8
     from .auto_model import AutoModel
 else:
     # Core entry points. These have no model-specific optional dependencies, so a plain
