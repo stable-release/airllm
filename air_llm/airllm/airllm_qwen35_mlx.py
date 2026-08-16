@@ -212,7 +212,14 @@ class AirLLMQwen35Mlx:
             cache = caches[index]
             mask = create_ssm_mask(hidden, cache) if layer.is_linear else create_attention_mask(hidden, cache)
             hidden = layer(hidden, mask=mask, cache=cache)
-            mx.eval(hidden)
+
+            # MLX is lazy.  Evaluating only `hidden` is not sufficient for Qwen's hybrid decoder:
+            # ArraysCache/KVCache updates can remain as unevaluated graphs that still reference the
+            # just-loaded layer weights.  Materialize both the activation and this layer's cache
+            # before deleting the layer so streaming actually releases those weights.  MLX-LM does
+            # the same during hybrid-model prefill by explicitly evaluating cache state.
+            mx.eval([hidden, cache.state])
+
             del layer
             self._cleanup()
             self.record_memory(f"after layer {index}")
