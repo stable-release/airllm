@@ -8,6 +8,7 @@ is_on_mac_os = platform == "darwin"
 if is_on_mac_os:
     from .airllm_llama_mlx import AirLLMLlamaMlx
     from .airllm_qwen35_mlx_fast import AirLLMQwen35Mlx
+    from .airllm_qwen35_mlx_fp8 import AirLLMQwen35MlxFp8
 
 # Architectures that need a dedicated AirLLM subclass because of a non-standard module layout
 # (custom remote-code models). Everything else uses the generic AirLLMBaseModel, which streams any
@@ -29,6 +30,40 @@ MAC_QWEN35_ARCHITECTURES = {
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5ForCausalLM",
 }
+
+
+def _config_dict(value):
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    try:
+        return dict(value)
+    except Exception:
+        return {}
+
+
+def _is_block_fp8_qwen(config, model_id):
+    """Detect pre-quantized 128x128 block-FP8 Qwen checkpoints before splitting weights."""
+    quant = _config_dict(getattr(config, "quantization_config", None))
+    block = quant.get("weight_block_size") or quant.get("weight_block_shape")
+    method = str(quant.get("quant_method", quant.get("quantization_method", ""))).lower()
+    fmt = str(quant.get("fmt", quant.get("format", ""))).lower()
+
+    block_fp8 = False
+    if block is not None:
+        try:
+            block_fp8 = list(block) == [128, 128] and ("fp8" in method or "fp8" in fmt or not method)
+        except TypeError:
+            block_fp8 = False
+
+    # Some repositories expose the quantization metadata only after custom-code loading. A model-id
+    # fallback prevents an FP8 checkpoint from accidentally falling through to the dense splitter.
+    model_name = str(model_id).lower()
+    name_fp8 = "fp8" in model_name
+    return block_fp8 or name_fp8
 
 
 class AutoModel:
@@ -66,6 +101,13 @@ class AutoModel:
             arch = architectures[0] if architectures else ""
 
             if arch in MAC_QWEN35_ARCHITECTURES or getattr(config, "model_type", "") == "qwen3_5":
+                if _is_block_fp8_qwen(config, pretrained_model_name_or_repo_id := pretrained_model_name_or_path):
+                    print(
+                        f"using AirLLM direct block-FP8 Qwen3.5-family MLX ingestion for: "
+                        f"{arch or config.model_type}"
+                    )
+                    return AirLLMQwen35MlxFp8(pretrained_model_name_or_repo_id, *inputs, **kwargs)
+
                 print(f"using AirLLM Qwen3.5-family MLX streaming backend for: {arch or config.model_type}")
                 return AirLLMQwen35Mlx(pretrained_model_name_or_path, *inputs, **kwargs)
 
