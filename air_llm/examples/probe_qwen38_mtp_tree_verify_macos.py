@@ -148,8 +148,12 @@ def _depth_layout(nodes):
     return by_depth, positions
 
 
+def _index_array(indices):
+    return mx.array(list(map(int, indices)), dtype=mx.int32)
+
+
 def _gather_arrays_cache(cache, indices):
-    idx = mx.array(indices, dtype=mx.int32)
+    idx = _index_array(indices)
     out = ArraysCache(len(cache.cache))
     out.cache = [None if value is None else value[idx] for value in cache.cache]
     if cache.left_padding is not None:
@@ -160,7 +164,7 @@ def _gather_arrays_cache(cache, indices):
 
 
 def _gather_kv_cache(cache, indices):
-    idx = mx.array(indices, dtype=mx.int32)
+    idx = _index_array(indices)
     out = KVCache()
     out.offset = cache.offset
     if cache.keys is not None:
@@ -242,7 +246,7 @@ def _verify_tree_batched(target, nodes, base_caches):
     del embedding
     target._cleanup()
 
-    hidden_by_depth = [all_hidden[ids] for ids in by_depth]
+    hidden_by_depth = [mx.take(all_hidden, _index_array(ids), axis=0) for ids in by_depth]
     del all_hidden
 
     # histories[layer][depth] is the batched cache after all nodes at that depth.
