@@ -1,10 +1,10 @@
 """Text-only AirLLM streaming backend for Qwen3.5-family models on Apple Silicon.
 
-Qwen3.8 checkpoints use the Qwen3.5-family text architecture internally.  Rather than duplicating
+Qwen3.8 checkpoints use the Qwen3.5-family text architecture internally. Rather than duplicating
 that architecture, this backend reuses MLX-LM's decoder layer and cache implementations while
 AirLLM remains responsible for storing/loading one decoder layer at a time.
 
-The first implementation intentionally ignores the vision tower and MTP head.  Its goal is a
+The first implementation intentionally ignores the vision tower and MTP head. Its goal is a
 minimal, low-memory text-generation path for machines that cannot keep Qwen3.8-27B resident.
 """
 
@@ -32,8 +32,6 @@ class AirLLMQwen35Mlx:
     """
 
     def set_layer_names_dict(self):
-        # Qwen3.8 is a multimodal ConditionalGeneration checkpoint.  Text weights live below
-        # model.language_model; vision weights are deliberately excluded from this text-only path.
         self.layer_names_dict = {
             "embed": "model.language_model.embed_tokens",
             "layer_prefix": "model.language_model.layers",
@@ -69,6 +67,16 @@ class AirLLMQwen35Mlx:
         self.initial_available = psutil.virtual_memory().available / 1024 / 1024
         self.least_available = self.initial_available
         self.set_layer_names_dict()
+
+        # A normal MLX-LM process benefits from keeping freed Metal buffers cached because the full
+        # model remains resident and similarly-sized allocations are reused. AirLLM has the opposite
+        # lifecycle: each ~decoder-layer allocation should leave Metal as soon as that layer has run.
+        # Disable the free-buffer cache so successive streamed layers do not accumulate residency.
+        self._previous_cache_limit = None
+        if hasattr(mx, "set_cache_limit"):
+            self._previous_cache_limit = mx.set_cache_limit(0)
+        if hasattr(mx, "reset_peak_memory"):
+            mx.reset_peak_memory()
 
         self.model_local_path, self.checkpoint_path = find_or_create_local_splitted_path(
             model_local_path_or_repo_id,
@@ -108,9 +116,24 @@ class AirLLMQwen35Mlx:
         self.least_available = min(self.least_available, available)
         consumed = self.initial_available - available
         max_consumed = self.initial_available - self.least_available
+
+        mlx_parts = []
+        for label, fn_name in (
+            ("mlx_active", "get_active_memory"),
+            ("mlx_cache", "get_cache_memory"),
+            ("mlx_peak", "get_peak_memory"),
+        ):
+            fn = getattr(mx, fn_name, None)
+            if fn is not None:
+                try:
+                    mlx_parts.append(f"{label}={fn() / 1024 / 1024:.02f}MB")
+                except Exception:
+                    pass
+
+        suffix = " " + " ".join(mlx_parts) if mlx_parts else ""
         print(
             f"[{msg}] available={available:.02f}MB consumed={consumed:.02f}MB "
-            f"max_consumed={max_consumed:.02f}MB"
+            f"max_consumed={max_consumed:.02f}MB{suffix}"
         )
 
     @staticmethod
@@ -124,12 +147,7 @@ class AirLLMQwen35Mlx:
 
     @staticmethod
     def _sanitize_qwen_layer(weights):
-        """Apply the same raw-checkpoint transforms MLX-LM uses for Qwen3.5-family models.
-
-        Official Qwen3.8 weights use the pre-MLX Conv1D layout and shifted RMSNorm convention.
-        MLX-LM normally detects this while sanitizing the complete checkpoint.  AirLLM only sees
-        one layer at a time, so the transformation is made explicit here.
-        """
+        """Apply the raw-checkpoint transforms MLX-LM uses for Qwen3.5-family models."""
         sanitized = dict(weights)
         norm_suffixes = (
             "input_layernorm.weight",
@@ -168,7 +186,6 @@ class AirLLMQwen35Mlx:
     def _load_norm(self):
         name = self.layer_names_dict["norm"]
         weights = self._strip_prefix(self._load_flat(name), name)
-        # Qwen3.8's final RMSNorm follows the same shifted-weight convention as decoder norms.
         if "weight" in weights and weights["weight"].ndim == 1:
             weights["weight"] = weights["weight"] + 1.0
         norm = nn.RMSNorm(self.model_args.hidden_size, eps=self.model_args.rms_norm_eps)
@@ -180,6 +197,7 @@ class AirLLMQwen35Mlx:
             embedding = self._load_embedding()
             logits = embedding.as_linear(hidden)
             mx.eval(logits)
+            mx.synchronize()
             del embedding
             self._cleanup()
             return logits
@@ -190,16 +208,23 @@ class AirLLMQwen35Mlx:
         output.update(tree_unflatten(list(weights.items())))
         logits = output(hidden)
         mx.eval(logits)
+        mx.synchronize()
         del output
         self._cleanup()
         return logits
 
     @staticmethod
     def _cleanup():
+        # Make sure submitted Metal work is retired before dropping references to a streamed layer.
+        synchronize = getattr(mx, "synchronize", None)
+        if synchronize is not None:
+            synchronize()
         gc.collect()
         clear_cache = getattr(mx, "clear_cache", None)
         if clear_cache is not None:
             clear_cache()
+        if synchronize is not None:
+            synchronize()
 
     def _new_cache(self, layer_index):
         is_linear = (layer_index + 1) % self.model_args.full_attention_interval != 0
@@ -213,12 +238,9 @@ class AirLLMQwen35Mlx:
             mask = create_ssm_mask(hidden, cache) if layer.is_linear else create_attention_mask(hidden, cache)
             hidden = layer(hidden, mask=mask, cache=cache)
 
-            # MLX is lazy.  Evaluating only `hidden` is not sufficient for Qwen's hybrid decoder:
-            # ArraysCache/KVCache updates can remain as unevaluated graphs that still reference the
-            # just-loaded layer weights.  Materialize both the activation and this layer's cache
-            # before deleting the layer so streaming actually releases those weights.  MLX-LM does
-            # the same during hybrid-model prefill by explicitly evaluating cache state.
+            # MLX is lazy. Materialize both activation and state before evicting layer weights.
             mx.eval([hidden, cache.state])
+            mx.synchronize()
 
             del layer
             self._cleanup()
@@ -249,25 +271,33 @@ class AirLLMQwen35Mlx:
         embedding = self._load_embedding()
         hidden = embedding(x)
         mx.eval(hidden)
+        mx.synchronize()
         del embedding
         self._cleanup()
 
         hidden = self._run_layers(hidden, caches)
+        self.record_memory("before final norm")
         norm = self._load_norm()
         hidden = norm(hidden)
         mx.eval(hidden)
+        mx.synchronize()
+        self.record_memory("after final norm")
         del norm
         self._cleanup()
 
+        self.record_memory("before logits")
         logits = self._project_logits(hidden[:, -1, :])
+        self.record_memory("after logits")
         token = self._sample(logits, temperature)
         mx.eval(token)
+        mx.synchronize()
         yield token
 
         while True:
             embedding = self._load_embedding()
             hidden = embedding(token[:, None])
             mx.eval(hidden)
+            mx.synchronize()
             del embedding
             self._cleanup()
 
@@ -275,12 +305,14 @@ class AirLLMQwen35Mlx:
             norm = self._load_norm()
             hidden = norm(hidden)
             mx.eval(hidden)
+            mx.synchronize()
             del norm
             self._cleanup()
 
             logits = self._project_logits(hidden[:, -1, :])
             token = self._sample(logits, temperature)
             mx.eval(token)
+            mx.synchronize()
             yield token
 
     def generate(self, x, temperature=0.0, max_new_tokens=128, **kwargs):
