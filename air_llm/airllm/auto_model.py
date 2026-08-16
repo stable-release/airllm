@@ -7,7 +7,7 @@ is_on_mac_os = platform == "darwin"
 
 if is_on_mac_os:
     from .airllm_llama_mlx import AirLLMLlamaMlx
-    from .airllm_qwen35_mlx import AirLLMQwen35Mlx
+    from .airllm_qwen35_mlx_fast import AirLLMQwen35Mlx
 
 # Architectures that need a dedicated AirLLM subclass because of a non-standard module layout
 # (custom remote-code models). Everything else uses the generic AirLLMBaseModel, which streams any
