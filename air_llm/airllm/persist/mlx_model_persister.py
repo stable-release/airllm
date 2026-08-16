@@ -57,13 +57,31 @@ class MlxModelPersister(ModelPersister):
         if not npz_path.exists() or not done_path.exists():
             return False
 
-        # Older AirLLM MLX shards used an empty marker and cast every floating tensor to fp16.
-        # Those shards are unsafe for Qwen3.5/Qwen3.8 because A_log must remain fp32. Treat them
-        # as stale so split_and_save_layers rebuilds them in place using the current representation.
         try:
-            return done_path.read_text(encoding="utf-8").strip() == MLX_SHARD_FORMAT_VERSION
+            marker = done_path.read_text(encoding="utf-8").strip()
         except OSError:
             return False
+
+        if marker == MLX_SHARD_FORMAT_VERSION:
+            return True
+
+        # Pre-v2 markers were empty. v2 only changes storage for Qwen's A_log tensors, so do not
+        # force a costly rewrite of embeddings, full-attention layers, norm or lm_head. Inspect the
+        # existing NPZ metadata: if the shard has no A_log it is representation-compatible and can
+        # simply be adopted into v2. Linear-attention shards do contain A_log and must be rebuilt
+        # from the original HF checkpoint to recover the fp32 values lost by the old fp16 cast.
+        if marker == "":
+            try:
+                arrays = mx.load(str(npz_path))
+                has_a_log = any(key.endswith("A_log") for key in arrays.keys())
+                del arrays
+                if not has_a_log:
+                    done_path.write_text(MLX_SHARD_FORMAT_VERSION, encoding="utf-8")
+                    return True
+            except Exception:
+                return False
+
+        return False
 
     def persist_model(self, state_dict, layer_name, saving_path):
         weights = {k: _tensor_to_numpy(k, v) for k, v in state_dict.items()}
