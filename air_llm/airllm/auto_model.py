@@ -1,14 +1,13 @@
 import importlib
-from transformers import AutoConfig
 from sys import platform
 
-is_on_mac_os = False
+from transformers import AutoConfig
 
-if platform == "darwin":
-    is_on_mac_os = True
+is_on_mac_os = platform == "darwin"
 
 if is_on_mac_os:
-    from airllm import AirLLMLlamaMlx
+    from .airllm_llama_mlx import AirLLMLlamaMlx
+    from .airllm_qwen35_mlx import AirLLMQwen35Mlx
 
 # Architectures that need a dedicated AirLLM subclass because of a non-standard module layout
 # (custom remote-code models). Everything else uses the generic AirLLMBaseModel, which streams any
@@ -24,6 +23,13 @@ ARCH_OVERRIDES = {
     "KimiK3ForConditionalGeneration": "AirLLMKimiK3",
 }
 
+# Qwen3.8 is branded as Qwen3.8 but the released checkpoints intentionally use the
+# Qwen3.5-family model classes/configuration internally. MLX-LM implements that family as qwen3_5.
+MAC_QWEN35_ARCHITECTURES = {
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5ForCausalLM",
+}
+
 
 class AutoModel:
     def __init__(self):
@@ -33,13 +39,16 @@ class AutoModel:
         )
 
     @classmethod
-    def get_module_class(cls, pretrained_model_name_or_path, *inputs, **kwargs):
-        if 'hf_token' in kwargs:
-            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True,
-                                                token=kwargs['hf_token'])
-        else:
-            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
+    def get_config(cls, pretrained_model_name_or_path, **kwargs):
+        token = kwargs.get("hf_token")
+        config_kwargs = {"trust_remote_code": True}
+        if token is not None:
+            config_kwargs["token"] = token
+        return AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
 
+    @classmethod
+    def get_module_class(cls, pretrained_model_name_or_path, *inputs, **kwargs):
+        config = cls.get_config(pretrained_model_name_or_path, **kwargs)
         architectures = getattr(config, "architectures", None) or []
         arch = architectures[0] if architectures else ""
 
@@ -51,11 +60,19 @@ class AutoModel:
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *inputs, **kwargs):
-
         if is_on_mac_os:
+            config = cls.get_config(pretrained_model_name_or_path, **kwargs)
+            architectures = getattr(config, "architectures", None) or []
+            arch = architectures[0] if architectures else ""
+
+            if arch in MAC_QWEN35_ARCHITECTURES or getattr(config, "model_type", "") == "qwen3_5":
+                print(f"using AirLLM Qwen3.5-family MLX streaming backend for: {arch or config.model_type}")
+                return AirLLMQwen35Mlx(pretrained_model_name_or_path, *inputs, **kwargs)
+
+            # Preserve AirLLM's historical Mac behavior for all other model families for now.
             return AirLLMLlamaMlx(pretrained_model_name_or_path, *inputs, **kwargs)
 
-        module, class_name = AutoModel.get_module_class(pretrained_model_name_or_path, *inputs, **kwargs)
+        module, class_name = cls.get_module_class(pretrained_model_name_or_path, *inputs, **kwargs)
         module = importlib.import_module(module)
         class_ = getattr(module, class_name)
         return class_(pretrained_model_name_or_path, *inputs, **kwargs)
