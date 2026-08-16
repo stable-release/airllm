@@ -1,6 +1,7 @@
 """Break down streamed Qwen3.8 MLX latency into load, compute, and cleanup costs."""
 
 import argparse
+import gc
 import time
 
 import mlx.core as mx
@@ -13,16 +14,34 @@ def _pct(part, total):
     return 100.0 * part / total if total else 0.0
 
 
-def _profile_embedding(model, token_ids):
+def _maybe_sync(barrier_mode):
+    # mx.eval() is already blocking. "safe" mirrors the current backend's extra barriers;
+    # "eval-only" mirrors current mlx-lm's eval + clear-cache pattern for an A/B measurement.
+    if barrier_mode == "safe":
+        mx.synchronize()
+
+
+def _profile_cleanup(model, barrier_mode):
+    if barrier_mode == "safe":
+        model._cleanup()
+        return
+
+    gc.collect()
+    clear_cache = getattr(mx, "clear_cache", None)
+    if clear_cache is not None:
+        clear_cache()
+
+
+def _profile_embedding(model, token_ids, barrier_mode):
     started = time.perf_counter()
     module = model._load_embedding()
     loaded = time.perf_counter()
     hidden = module(token_ids)
     mx.eval(hidden)
-    mx.synchronize()
+    _maybe_sync(barrier_mode)
     computed = time.perf_counter()
     del module
-    model._cleanup()
+    _profile_cleanup(model, barrier_mode)
     finished = time.perf_counter()
     return hidden, {
         "load": loaded - started,
@@ -32,16 +51,16 @@ def _profile_embedding(model, token_ids):
     }
 
 
-def _profile_norm(model, hidden):
+def _profile_norm(model, hidden, barrier_mode):
     started = time.perf_counter()
     module = model._load_norm()
     loaded = time.perf_counter()
     hidden = module(hidden)
     mx.eval(hidden)
-    mx.synchronize()
+    _maybe_sync(barrier_mode)
     computed = time.perf_counter()
     del module
-    model._cleanup()
+    _profile_cleanup(model, barrier_mode)
     finished = time.perf_counter()
     return hidden, {
         "load": loaded - started,
@@ -51,7 +70,7 @@ def _profile_norm(model, hidden):
     }
 
 
-def _profile_layers(model, hidden, caches):
+def _profile_layers(model, hidden, caches, barrier_mode):
     rows = []
     totals = {"load": 0.0, "mask": 0.0, "compute": 0.0, "cleanup": 0.0, "total": 0.0}
 
@@ -65,13 +84,16 @@ def _profile_layers(model, hidden, caches):
         masked = time.perf_counter()
 
         hidden = layer(hidden, mask=mask, cache=cache)
+        # Materializing the cache state is non-negotiable for Qwen's hybrid decoder: otherwise an
+        # unevaluated ArraysCache/KVCache graph can retain streamed layer weights. Only the extra
+        # synchronize barriers are varied by this profiler.
         mx.eval([hidden, cache.state])
-        mx.synchronize()
+        _maybe_sync(barrier_mode)
         computed = time.perf_counter()
 
         layer_kind = "delta" if layer.is_linear else "attention"
         del layer
-        model._cleanup()
+        _profile_cleanup(model, barrier_mode)
         finished = time.perf_counter()
 
         row = {
@@ -91,25 +113,26 @@ def _profile_layers(model, hidden, caches):
 
 
 def _profile_logits(model, hidden):
+    # Keep the backend's known-good lm_head path for this experiment. The decoder accounts for >90%
+    # of pass time, so isolating its barriers is sufficient before changing production behavior.
     started = time.perf_counter()
     logits = model._project_logits(hidden[:, -1, :])
-    mx.synchronize()
     finished = time.perf_counter()
     return logits, {"total": finished - started}
 
 
-def _profile_pass(model, token_ids, caches, label):
+def _profile_pass(model, token_ids, caches, label, barrier_mode):
     pass_started = time.perf_counter()
 
-    hidden, embedding = _profile_embedding(model, token_ids)
-    hidden, layers, rows = _profile_layers(model, hidden, caches)
-    hidden, norm = _profile_norm(model, hidden)
+    hidden, embedding = _profile_embedding(model, token_ids, barrier_mode)
+    hidden, layers, rows = _profile_layers(model, hidden, caches, barrier_mode)
+    hidden, norm = _profile_norm(model, hidden, barrier_mode)
     logits, head = _profile_logits(model, hidden)
 
     sample_started = time.perf_counter()
     token = model._sample(logits, 0.0)
     mx.eval(token)
-    mx.synchronize()
+    _maybe_sync(barrier_mode)
     sample_total = time.perf_counter() - sample_started
 
     total = time.perf_counter() - pass_started
@@ -118,6 +141,7 @@ def _profile_pass(model, token_ids, caches, label):
 
     return token, {
         "label": label,
+        "barrier_mode": barrier_mode,
         "token_id": token_id,
         "piece": piece,
         "embedding": embedding,
@@ -138,6 +162,7 @@ def _print_pass(result):
     head = result["head"]
 
     print(f"\n=== {result['label']} ===")
+    print(f"barrier mode:            {result['barrier_mode']}")
     print(f"token:                   id={result['token_id']} piece={result['piece']!r}")
     print(f"pass total:              {total:8.3f} s")
     print(f"embedding total:         {embedding['total']:8.3f} s  ({_pct(embedding['total'], total):5.1f}%)")
@@ -181,6 +206,16 @@ def main():
     parser.add_argument("--compression", default="4bit", choices=["none", "4bit"])
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--layer-path", default=None)
+    parser.add_argument(
+        "--barrier-mode",
+        default="safe",
+        choices=["safe", "eval-only"],
+        help=(
+            "safe mirrors the current backend's extra mx.synchronize() barriers; eval-only keeps "
+            "blocking mx.eval() cache materialization and mx.clear_cache() but removes redundant "
+            "explicit synchronization for this profiling run."
+        ),
+    )
     args = parser.parse_args()
 
     compression = None if args.compression == "none" else args.compression
@@ -211,9 +246,13 @@ def main():
     input_ids = mx.array(inputs["input_ids"])
     caches = [model._new_cache(i) for i in range(model.model_args.num_hidden_layers)]
 
-    first_token, prefill = _profile_pass(model, input_ids, caches, "prefill / first token")
+    first_token, prefill = _profile_pass(
+        model, input_ids, caches, "prefill / first token", args.barrier_mode
+    )
     second_input = first_token[:, None]
-    _, decode = _profile_pass(model, second_input, caches, "single-token decode")
+    _, decode = _profile_pass(
+        model, second_input, caches, "single-token decode", args.barrier_mode
+    )
 
     print(f"weights: {'MLX affine 4-bit' if getattr(model, 'mlx_quantized', False) else 'FP16'}")
     print(f"prompt tokens: {int(input_ids.shape[1])}")
