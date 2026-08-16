@@ -18,21 +18,31 @@ def _format_bytes(value):
 
 
 def _logical_stream_bytes(model):
-    """Return bytes AirLLM logically reloads for one complete model pass.
+    """Return steady-state streamed and resident logical weight bytes for one model pass.
 
-    This is intentionally a logical file-size metric. macOS may satisfy some reads from the file
-    cache, so it is not a claim about physical SSD traffic.
+    File sizes are a logical metric. macOS may satisfy some reads from the file cache, and resident
+    components are loaded on first use before being retained for subsequent decode passes.
     """
     checkpoint_path = Path(model.checkpoint_path)
-    total = 0
-    files = []
+    resident_names = set(getattr(model, "resident_layer_names", set()))
+    streamed_total = 0
+    resident_total = 0
+    streamed_files = []
+    resident_files = []
+
     for layer_name in model.layer_names:
         path = checkpoint_path / f"{layer_name}.mlx.npz"
-        if path.exists():
-            size = path.stat().st_size
-            total += size
-            files.append((path, size))
-    return total, files
+        if not path.exists():
+            continue
+        size = path.stat().st_size
+        if layer_name in resident_names:
+            resident_total += size
+            resident_files.append((path, size))
+        else:
+            streamed_total += size
+            streamed_files.append((path, size))
+
+    return streamed_total, streamed_files, resident_total, resident_files
 
 
 def _mlx_memory_mb(name):
@@ -59,6 +69,15 @@ def main():
         help=(
             "Use MLX-native affine 4-bit streamed weights on macOS. The first run prepares a "
             "separate resumable quantized sidecar; the existing FP16 split is retained."
+        ),
+    )
+    parser.add_argument(
+        "--resident-gib",
+        type=float,
+        default=0.0,
+        help=(
+            "Keep up to this many GiB of reusable 4-bit components resident in unified memory. "
+            "The embedding/lm_head and then the largest decoder shards are prioritized."
         ),
     )
     parser.add_argument(
@@ -92,15 +111,17 @@ def main():
         layer_shards_saving_path=args.layer_path,
         show_memory_util=args.show_memory,
         compression=args.compression,
+        mlx_resident_gib=args.resident_gib,
     )
 
     if args.prepare_only:
-        logical_bytes, shard_files = _logical_stream_bytes(model)
+        logical_bytes, shard_files, resident_bytes, resident_files = _logical_stream_bytes(model)
         print("preparation complete")
         print(f"weights: {'MLX affine 4-bit' if getattr(model, 'mlx_quantized', False) else 'FP16'}")
         print(f"checkpoint path: {model.checkpoint_path}")
-        print(f"streamed shard files/pass: {len(shard_files)}")
-        print(f"logical weight bytes/pass: {_format_bytes(logical_bytes)}")
+        print(f"resident components: {len(resident_files)} ({_format_bytes(resident_bytes)})")
+        print(f"steady-state streamed files/pass: {len(shard_files)}")
+        print(f"steady-state logical bytes/pass: {_format_bytes(logical_bytes)}")
         return
 
     messages = [
@@ -127,8 +148,6 @@ def main():
     input_ids = mx.array(inputs["input_ids"])
     prompt_tokens = int(input_ids.shape[1])
 
-    # Keep the simple path available for normal smoke tests. Benchmark/debug mode consumes the
-    # underlying token generator directly so we can timestamp each completed model pass.
     if not args.debug_tokens and not args.benchmark:
         output = model.generate(
             input_ids,
@@ -138,11 +157,12 @@ def main():
         print(output)
         return
 
-    logical_bytes, shard_files = _logical_stream_bytes(model)
+    logical_bytes, shard_files, resident_bytes, resident_files = _logical_stream_bytes(model)
     if args.benchmark:
         print(f"prompt tokens: {prompt_tokens}")
-        print(f"streamed shard files/pass: {len(shard_files)}")
-        print(f"logical weight bytes/pass: {_format_bytes(logical_bytes)}")
+        print(f"resident components: {len(resident_files)} ({_format_bytes(resident_bytes)})")
+        print(f"steady-state streamed shard files/pass: {len(shard_files)}")
+        print(f"steady-state logical weight bytes/pass: {_format_bytes(logical_bytes)}")
 
     token_ids = []
     token_times = []
@@ -189,6 +209,8 @@ def main():
     print(f"weights:                 {'MLX affine 4-bit' if getattr(model, 'mlx_quantized', False) else 'FP16'}")
     print(f"prompt tokens:           {prompt_tokens}")
     print(f"generated tokens:        {len(token_ids)}")
+    print(f"resident components:     {len(resident_files)}")
+    print(f"resident logical bytes:  {_format_bytes(resident_bytes)}")
     print(f"first-token latency:     {first_token_s:.3f} s")
     print(f"prefill prompt rate*:    {prompt_tokens / first_token_s:.3f} prompt tok/s")
 
@@ -200,13 +222,13 @@ def main():
         print(f"average decode/token:    {avg_decode:.3f} s")
         print(f"decode throughput:       {1.0 / avg_decode:.3f} tok/s")
         if logical_bytes:
-            print(f"logical bytes/token:     {_format_bytes(logical_bytes)}")
+            print(f"steady-state bytes/token:{_format_bytes(logical_bytes):>16s}")
             print(f"logical stream rate:     {_format_bytes(logical_bytes / avg_decode)}/s")
     else:
         print("decode metrics:          need at least 2 generated tokens")
 
     print(f"total generation time:   {total_s:.3f} s")
-    print(f"logical bytes/pass:      {_format_bytes(logical_bytes)}")
+    print(f"steady-state bytes/pass: {_format_bytes(logical_bytes)}")
 
     active_mb = _mlx_memory_mb("get_active_memory")
     cache_mb = _mlx_memory_mb("get_cache_memory")
@@ -218,8 +240,9 @@ def main():
     if peak_mb is not None:
         print(f"MLX peak memory:         {peak_mb:.2f} MiB")
 
-    print("* First-token time includes embedding, the full streamed prefill pass, norm, lm_head, and sampling.")
-    print("  'Logical bytes' are shard file sizes traversed per pass; macOS filesystem caching can reduce physical SSD reads.")
+    print("* First-token time includes first-use loading of resident components plus streamed prefill.")
+    print("  Steady-state logical bytes exclude resident components and represent subsequent decode passes.")
+    print("  macOS filesystem caching can reduce physical SSD reads below logical file-size traffic.")
 
 
 if __name__ == "__main__":
