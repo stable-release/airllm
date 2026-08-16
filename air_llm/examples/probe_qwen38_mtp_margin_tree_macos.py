@@ -17,7 +17,6 @@ import mlx.core as mx
 import numpy as np
 
 from probe_qwen38_mtp_macos import _load_native_mtp, _target_forward
-from probe_qwen38_mtp_prefilled_macos import _mtp_forward
 from probe_qwen38_mtp_rank_macos import _make_target, _topk
 from probe_qwen38_mtp_beam_survival_macos import _replay_path
 
@@ -105,7 +104,8 @@ def main():
                 branch_events += 1
 
             m = float(np.max(logits))
-            z = m + float(np.log(np.exp(logits - m, dtype=np.float64).sum()))
+            exp_sum = np.exp((logits - m).astype(np.float64)).sum()
+            z = m + float(np.log(exp_sum))
             for tok in candidates:
                 expanded.append((score + float(logits[tok]) - z, path + (tok,)))
                 total_nodes += 1
