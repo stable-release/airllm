@@ -36,6 +36,9 @@ setuptools.setup(
         'huggingface-hub',
         'scipy',
         'sentencepiece',
+        # Qwen3.8 uses the Qwen3.5-family hybrid decoder.  On Apple Silicon we reuse MLX-LM's
+        # implementation while AirLLM supplies layer-at-a-time persistence and execution.
+        'mlx-lm>=0.31.3; platform_system=="Darwin"',
         # 'bitsandbytes' is optional (used only for --compression); we fall back gracefully when absent.
         # 'compressed-tensors' is optional too: only checkpoints stored in that format (Kimi K3's
         # MXFP4 weights) need it, and transformers raises a clear error naming it when it is missing.
