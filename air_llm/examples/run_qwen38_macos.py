@@ -53,6 +53,15 @@ def main():
     parser.add_argument("--layer-path", default=None)
     parser.add_argument("--show-memory", action="store_true")
     parser.add_argument(
+        "--compression",
+        choices=["4bit"],
+        default=None,
+        help=(
+            "Use MLX-native affine 4-bit streamed weights on macOS. The first run prepares a "
+            "separate resumable quantized sidecar; the existing FP16 split is retained."
+        ),
+    )
+    parser.add_argument(
         "--thinking",
         action="store_true",
         help="Enable Qwen3.8 thinking mode. The smoke test defaults to direct/non-thinking mode.",
@@ -74,6 +83,7 @@ def main():
         max_seq_len=args.max_seq_len,
         layer_shards_saving_path=args.layer_path,
         show_memory_util=args.show_memory,
+        compression=args.compression,
     )
 
     messages = [
@@ -86,6 +96,7 @@ def main():
         enable_thinking=args.thinking,
     )
     print(f"chat mode: {'thinking' if args.thinking else 'non-thinking'}")
+    print(f"weights: {'MLX affine 4-bit' if getattr(model, 'mlx_quantized', False) else 'FP16'}")
     print(f"prompt tail: {prompt[-200:]!r}")
 
     inputs = model.tokenizer(
@@ -158,6 +169,7 @@ def main():
     decode_intervals = [token_times[i] - token_times[i - 1] for i in range(1, len(token_times))]
 
     print("\n=== AirLLM Qwen3.8 benchmark ===")
+    print(f"weights:                 {'MLX affine 4-bit' if getattr(model, 'mlx_quantized', False) else 'FP16'}")
     print(f"prompt tokens:           {prompt_tokens}")
     print(f"generated tokens:        {len(token_ids)}")
     print(f"first-token latency:     {first_token_s:.3f} s")
