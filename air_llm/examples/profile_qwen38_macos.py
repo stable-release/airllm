@@ -16,7 +16,7 @@ def _pct(part, total):
 
 def _maybe_sync(barrier_mode):
     # mx.eval() is already blocking. "safe" mirrors the current backend's extra barriers;
-    # "eval-only" mirrors current mlx-lm's eval + clear-cache pattern for an A/B measurement.
+    # the other modes keep cache-state materialization but remove explicit synchronization.
     if barrier_mode == "safe":
         mx.synchronize()
 
@@ -26,7 +26,12 @@ def _profile_cleanup(model, barrier_mode):
         model._cleanup()
         return
 
-    gc.collect()
+    if barrier_mode == "eval-only":
+        gc.collect()
+
+    # "eval-clear" deliberately skips a full Python cyclic-GC scan on every streamed layer.
+    # CPython reference counting still releases the just-deleted layer object immediately when it
+    # has no cycles. MLX's free-buffer cache is cleared in both experimental modes.
     clear_cache = getattr(mx, "clear_cache", None)
     if clear_cache is not None:
         clear_cache()
@@ -85,8 +90,8 @@ def _profile_layers(model, hidden, caches, barrier_mode):
 
         hidden = layer(hidden, mask=mask, cache=cache)
         # Materializing the cache state is non-negotiable for Qwen's hybrid decoder: otherwise an
-        # unevaluated ArraysCache/KVCache graph can retain streamed layer weights. Only the extra
-        # synchronize barriers are varied by this profiler.
+        # unevaluated ArraysCache/KVCache graph can retain streamed layer weights. Only redundant
+        # barriers and Python cyclic-GC scans are varied by this profiler.
         mx.eval([hidden, cache.state])
         _maybe_sync(barrier_mode)
         computed = time.perf_counter()
@@ -114,7 +119,7 @@ def _profile_layers(model, hidden, caches, barrier_mode):
 
 def _profile_logits(model, hidden):
     # Keep the backend's known-good lm_head path for this experiment. The decoder accounts for >90%
-    # of pass time, so isolating its barriers is sufficient before changing production behavior.
+    # of pass time, so isolating its barriers/cleanup is sufficient before changing production code.
     started = time.perf_counter()
     logits = model._project_logits(hidden[:, -1, :])
     finished = time.perf_counter()
@@ -209,11 +214,11 @@ def main():
     parser.add_argument(
         "--barrier-mode",
         default="safe",
-        choices=["safe", "eval-only"],
+        choices=["safe", "eval-only", "eval-clear"],
         help=(
-            "safe mirrors the current backend's extra mx.synchronize() barriers; eval-only keeps "
-            "blocking mx.eval() cache materialization and mx.clear_cache() but removes redundant "
-            "explicit synchronization for this profiling run."
+            "safe mirrors the current backend; eval-only removes explicit synchronize calls but "
+            "keeps full gc.collect() per component; eval-clear keeps blocking mx.eval() cache "
+            "materialization plus mx.clear_cache() and skips per-layer cyclic GC."
         ),
     )
     args = parser.parse_args()
