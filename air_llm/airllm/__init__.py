@@ -1,12 +1,10 @@
 from sys import platform
 
-is_on_mac_os = False
-
-if platform == "darwin":
-    is_on_mac_os = True
+is_on_mac_os = platform == "darwin"
 
 if is_on_mac_os:
     from .airllm_llama_mlx import AirLLMLlamaMlx
+    from .airllm_qwen35_mlx import AirLLMQwen35Mlx
     from .auto_model import AutoModel
 else:
     # Core entry points. These have no model-specific optional dependencies, so a plain
@@ -41,4 +39,3 @@ else:
                 f"airllm: optional model class {_name} is unavailable ({_e}). "
                 f"This only affects that specific model family; the generic streaming path still works."
             )
-
