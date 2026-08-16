@@ -9,6 +9,11 @@ from mlx.utils import tree_unflatten
 from .model_persister import ModelPersister
 
 
+# Increment whenever the on-disk MLX representation changes in a way that can affect inference.
+# v2 preserves Qwen3.5-family Gated DeltaNet A_log tensors in fp32 instead of casting them to fp16.
+MLX_SHARD_FORMAT_VERSION = "airllm-mlx-v2"
+
+
 def map_torch_to_mlx(model):
     """Map the legacy Llama MLX backend's Hugging Face names to its local module names."""
     model = {k.replace("model.", ""): v for k, v in model.items()}
@@ -47,15 +52,26 @@ class MlxModelPersister(ModelPersister):
         super().__init__(*args, **kwargs)
 
     def model_persist_exist(self, layer_name, saving_path):
-        npz_exists = os.path.exists(str(saving_path / (layer_name + "mlx.npz")))
-        done_marker_exists = os.path.exists(str(saving_path / (layer_name + "mlx.done")))
-        return npz_exists and done_marker_exists
+        npz_path = saving_path / (layer_name + "mlx.npz")
+        done_path = saving_path / (layer_name + "mlx.done")
+        if not npz_path.exists() or not done_path.exists():
+            return False
+
+        # Older AirLLM MLX shards used an empty marker and cast every floating tensor to fp16.
+        # Those shards are unsafe for Qwen3.5/Qwen3.8 because A_log must remain fp32. Treat them
+        # as stale so split_and_save_layers rebuilds them in place using the current representation.
+        try:
+            return done_path.read_text(encoding="utf-8").strip() == MLX_SHARD_FORMAT_VERSION
+        except OSError:
+            return False
 
     def persist_model(self, state_dict, layer_name, saving_path):
         weights = {k: _tensor_to_numpy(k, v) for k, v in state_dict.items()}
         np.savez(saving_path / (layer_name + "mlx"), **weights)
         print(f"saved as: {saving_path / (layer_name + 'mlx')}")
-        (saving_path / (layer_name + "mlx.done")).touch()
+        (saving_path / (layer_name + "mlx.done")).write_text(
+            MLX_SHARD_FORMAT_VERSION, encoding="utf-8"
+        )
 
     def load_model_flat(self, layer_name, path):
         """Load original Hugging Face weight names without Llama-specific rewriting.
