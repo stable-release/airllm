@@ -11,7 +11,7 @@ strategy:
   instead of retaining a multi-megabyte recurrent state for every tree node;
 * after target logits select the exact greedy prefix, reconstruct only that prefix's DeltaNet cache
   with ``gated_delta_update`` (no decoder weights need to be reloaded);
-* for full-attention layers, select one descendant leaf's KV row and rewind it to the accepted prefix;
+* for full-attention layers, retain only new leaf KV suffixes and append the selected prefix;
 * compare selected predictions to an ordinary linear target pass, then consume the correction token
   through both recovered and reference caches and require the next greedy token to match.
 
@@ -20,6 +20,7 @@ native-MTP generator.
 """
 
 import argparse
+from dataclasses import dataclass
 import time
 
 import mlx.core as mx
@@ -57,14 +58,27 @@ def _repeat_base_cache(cache, batch_size):
     return verifier._gather_cache(cache, [0] * int(batch_size))
 
 
-def _copy_compact_kv(cache):
-    out = KVCache()
-    out.offset = cache.offset
-    if cache.keys is not None:
-        keys, values = cache.state
-        out.keys = _copy_array(keys)
-        out.values = _copy_array(values)
-    return out
+@dataclass
+class _KVSuffix:
+    base_offset: int
+    keys: object
+    values: object
+
+
+def _copy_kv_suffix(cache, base_offset):
+    """Retain only leaf tokens added after the shared persistent KV prefix."""
+    if cache.keys is None:
+        raise RuntimeError("Leaf attention verification produced an empty KV cache")
+    if base_offset < 0 or base_offset > cache.offset:
+        raise RuntimeError(
+            f"Invalid KV suffix range: base={base_offset}, final={cache.offset}"
+        )
+    keys, values = cache.state
+    return _KVSuffix(
+        base_offset=int(base_offset),
+        keys=_copy_array(keys[..., base_offset : cache.offset, :]),
+        values=_copy_array(values[..., base_offset : cache.offset, :]),
+    )
 
 
 def _linear_layer_capture(layer, hidden, mask, cache):
@@ -112,6 +126,7 @@ def _linear_layer_capture(layer, hidden, mask, cache):
     k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
     state_in = cache[1]
+    use_kernel = not attn.training
     out, state_out = gated_delta_update(
         q,
         k,
@@ -122,7 +137,7 @@ def _linear_layer_capture(layer, hidden, mask, cache):
         attn.dt_bias,
         state_in,
         mask,
-        use_kernel=not attn.training,
+        use_kernel=use_kernel,
     )
     cache[1] = state_out
     cache.advance(S)
@@ -146,6 +161,7 @@ def _linear_layer_capture(layer, hidden, mask, cache):
         "A_log": A_log,
         "dt_bias": dt_bias,
         "mask": mask,
+        "use_kernel": use_kernel,
         "n_keep": n_keep,
         "conv_dim": attn.conv_dim,
     }
@@ -197,7 +213,10 @@ def _verify_leaves(target, nodes, active_leaf_ids, base_caches):
         else:
             hidden = layer(hidden, mask=mask, cache=work)
             mx.eval(hidden, work.state)
-            attention_caches[layer_index] = _copy_compact_kv(work)
+            attention_caches[layer_index] = _copy_kv_suffix(
+                work,
+                base_caches[layer_index].offset,
+            )
 
         mx.eval(hidden)
         del layer, work
@@ -304,7 +323,7 @@ def _recover_selected_caches(
                 capture["dt_bias"],
                 base[1],
                 mask,
-                use_kernel=True,
+                use_kernel=capture["use_kernel"],
             )
             base[0] = new_conv
             base[1] = new_state
@@ -313,14 +332,41 @@ def _recover_selected_caches(
             continue
 
         saved = attention_caches[layer_index]
-        if saved is None or not isinstance(base, KVCache):
+        if not isinstance(saved, _KVSuffix) or not isinstance(base, KVCache):
             raise TypeError("Full-attention layer missing saved KV batch")
-        new_offset = base.offset + keep_tokens
-        if saved.keys is None:
-            raise RuntimeError("Saved full-attention KV cache unexpectedly empty")
-        base.keys = _copy_array(saved.keys[selected_row : selected_row + 1, ..., :new_offset, :])
-        base.values = _copy_array(saved.values[selected_row : selected_row + 1, ..., :new_offset, :])
-        base.offset = new_offset
+        if base.offset != saved.base_offset:
+            raise RuntimeError(
+                f"Persistent KV offset changed during leaf verification: "
+                f"base={base.offset}, captured={saved.base_offset}"
+            )
+        if keep_tokens > saved.keys.shape[-2]:
+            raise RuntimeError(
+                f"KV commit requested {keep_tokens} tokens from a "
+                f"{saved.keys.shape[-2]}-token suffix"
+            )
+
+        selected_keys = saved.keys[
+            selected_row : selected_row + 1,
+            ...,
+            :keep_tokens,
+            :,
+        ]
+        selected_values = saved.values[
+            selected_row : selected_row + 1,
+            ...,
+            :keep_tokens,
+            :,
+        ]
+        if base.keys is None:
+            base.keys = _copy_array(selected_keys)
+            base.values = _copy_array(selected_values)
+        else:
+            prefix_keys = base.keys[..., : base.offset, :]
+            prefix_values = base.values[..., : base.offset, :]
+            base.keys = mx.concatenate([prefix_keys, selected_keys], axis=-2)
+            base.values = mx.concatenate([prefix_values, selected_values], axis=-2)
+        base.offset += keep_tokens
+        mx.eval(base.keys, base.values)
 
     mx.eval([cache.state for cache in target_caches])
 

@@ -341,6 +341,7 @@ def main():
         total_tree_nodes += len(nodes)
         max_tree_nodes = max(max_tree_nodes, len(nodes))
         max_frontier = max(max_frontier, len(active))
+        actual_depth = max(int(node.depth) for node in nodes)
 
         verify_started = time.perf_counter()
         (
@@ -384,8 +385,9 @@ def main():
         useful_total += len(emitted)
 
         print(
-            f"\n[tree {cycle_count}] depth={step_budget} nodes={len(nodes)} "
-            f"frontier={len(active)} accepted={len(accepted_tokens)}/{step_budget} "
+            f"\n[tree {cycle_count}] requested_depth={step_budget} actual_depth={actual_depth} "
+            f"nodes={len(nodes)} frontier={len(active)} "
+            f"accepted={len(accepted_tokens)}/{actual_depth} "
             f"budget_pruned={'yes' if budget_pruned else 'no'}"
         )
         print(
