@@ -9,12 +9,22 @@ if is_on_mac_os:
     from .airllm_llama_mlx import AirLLMLlamaMlx
     from .auto_model import AutoModel
 else:
-    # Core entry points. These have no model-specific optional dependencies, so a plain
-    # `import airllm` always works as long as torch/transformers are installed.
-    from .airllm_base import AirLLMBaseModel
+    # Core entry points. AutoModel and the GGUF backend are stdlib-only, so a plain
+    # `import airllm` always works even without torch/transformers; the safetensors
+    # streaming path additionally needs the ML stack and degrades gracefully without it.
     from .auto_model import AutoModel
-    from .utils import split_and_save_layers
-    from .utils import NotEnoughSpaceException
+    from .airllm_gguf import AirLLMGGUF
+
+    try:
+        from .airllm_base import AirLLMBaseModel
+        from .utils import split_and_save_layers
+        from .utils import NotEnoughSpaceException
+    except ImportError as _e:
+        import warnings as _warnings
+        _warnings.warn(
+            f"airllm: safetensors streaming backend unavailable ({_e}). "
+            f"GGUF models still work; install torch/transformers/accelerate for safetensors models."
+        )
 
     # Dedicated subclasses for a handful of custom-architecture models. Some of them pull in
     # optional extras (e.g. the Baichuan tokenizer needs `sentencepiece`). Import them defensively
@@ -32,6 +42,7 @@ else:
         ("AirLLMMistral", ".airllm_mistral"),
         ("AirLLMMixtral", ".airllm_mixtral"),
         ("AirLLMKimiK3", ".airllm_kimi_k3"),
+        ("AirLLMQwen3_5", ".airllm_qwen3_5"),
     ):
         try:
             _mod = __import__(__name__ + _module, fromlist=[_name])

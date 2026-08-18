@@ -1,5 +1,4 @@
 import importlib
-from transformers import AutoConfig
 from sys import platform
 
 is_on_mac_os = False
@@ -22,6 +21,7 @@ ARCH_OVERRIDES = {
     "BaiChuanForCausalLM": "AirLLMBaichuan",
     "InternLMForCausalLM": "AirLLMInternLM",
     "KimiK3ForConditionalGeneration": "AirLLMKimiK3",
+    "Qwen3_5ForConditionalGeneration": "AirLLMQwen3_5",
 }
 
 
@@ -34,6 +34,8 @@ class AutoModel:
 
     @classmethod
     def get_module_class(cls, pretrained_model_name_or_path, *inputs, **kwargs):
+        # Imported lazily so the GGUF backend (stdlib-only) works without transformers installed.
+        from transformers import AutoConfig
         if 'hf_token' in kwargs:
             config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True,
                                                 token=kwargs['hf_token'])
@@ -50,7 +52,20 @@ class AutoModel:
         return "airllm", cls_name
 
     @classmethod
+    def _is_gguf_path(cls, path):
+        from pathlib import Path
+        p = Path(str(path))
+        if p.suffix.lower() == ".gguf":
+            return True
+        return p.is_dir() and any(p.glob("*.gguf"))
+
+    @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *inputs, **kwargs):
+        # GGUF container files are not safetensors checkpoints and cannot be layer-streamed
+        # by the native AirLLM loader; route them to the llama.cpp-backed GGUF backend.
+        if cls._is_gguf_path(pretrained_model_name_or_path):
+            from .airllm_gguf import AirLLMGGUF
+            return AirLLMGGUF(pretrained_model_name_or_path, *inputs, **kwargs)
 
         if is_on_mac_os:
             return AirLLMLlamaMlx(pretrained_model_name_or_path, *inputs, **kwargs)

@@ -12,7 +12,7 @@ from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers.quantizers import AutoHfQuantizer
 
-from .profiler import LayeredProfiler
+from .profiler import LayeredProfiler, StreamStats
 
 from .utils import clean_memory, load_layer, layer_tensor_names, load_layer_subset, \
     find_or_create_local_splitted_path
@@ -111,6 +111,8 @@ class AirLLMBaseModel:
 
         self.profiling_mode = profiling_mode
         self.profiler = LayeredProfiler()
+        # Always-on disk/GPU transfer counters (bytes + seconds), cheap enough to keep live.
+        self.stream_stats = StreamStats()
 
         self.total_disk_loading_time = None
         self.total_gpu_loading_time = None
@@ -230,14 +232,25 @@ class AirLLMBaseModel:
 
         walk(self.config)
 
+    def get_auto_class(self):
+        """The auto-class used to build the runtime model from the config.
+
+        The default suits text-only checkpoints. Multimodal checkpoints whose weights are named
+        for the wrapper class (e.g. ``model.language_model.layers.*``) must override this to the
+        matching wrapper auto-class: AutoModelForCausalLM would build the bare text model, whose
+        module paths don't line up with the checkpoint's tensor names.
+        """
+        return AutoModelForCausalLM
+
     def init_model(self):
         # Build the real model on meta (no memory). include_buffers=False so non-persistent
         # buffers such as rotary inv_freq are actually computed (they aren't in the checkpoint).
+        auto_class = self.get_auto_class()
         self.model = None
         try:
             self._propagate_attn_implementation("sdpa")
             with init_empty_weights(include_buffers=False):
-                self.model = AutoModelForCausalLM.from_config(
+                self.model = auto_class.from_config(
                     self.config, attn_implementation="sdpa", trust_remote_code=self.trust_remote_code)
         except (ValueError, TypeError) as e:
             print(f"attn_implementation='sdpa' not available ({e}), falling back to eager attention")
@@ -247,7 +260,7 @@ class AirLLMBaseModel:
             # must request eager explicitly; otherwise transformers re-selects sdpa and errors again.
             self._propagate_attn_implementation("eager")
             with init_empty_weights(include_buffers=False):
-                self.model = AutoModelForCausalLM.from_config(
+                self.model = auto_class.from_config(
                     self.config, attn_implementation="eager", trust_remote_code=self.trust_remote_code)
 
         quantization_config = getattr(self.config, "quantization_config", None)
@@ -345,6 +358,9 @@ class AirLLMBaseModel:
             self.profiler.add_profiling_time('compression_time', compression_time)
         else:
             state_dict = load_layer_output
+
+        self.stream_stats.add_disk(
+            sum(v.numel() * v.element_size() for v in state_dict.values()), elapsed_time)
 
         if self.prefetching and torch.cuda.is_available():
             # pin_memory() returns a pinned copy rather than pinning in place, so the result has to
@@ -504,6 +520,7 @@ class AirLLMBaseModel:
         )
 
     def move_layer_to_device(self, state_dict):
+        t_move = time.time()
         self._restore_plain_weight_modules(state_dict)
         state_dict = self._decompress_state_dict(state_dict)
         moved = []
@@ -524,6 +541,9 @@ class AirLLMBaseModel:
                     set_module_tensor_to_device(self.model, param_name, self.running_device,
                                                 value=value, dtype=self.running_dtype)
             moved.append(param_name)
+        self.stream_stats.add_gpu(
+            sum(v.numel() * v.element_size() for v in state_dict.values()),
+            time.time() - t_move)
         return moved
 
     # Suffixes of the companion tensors that pre-quantized checkpoints ship alongside a weight
